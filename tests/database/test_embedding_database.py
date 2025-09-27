@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pytest import MonkeyPatch
 
 from img_search.database import embeddings as embeddings_module
 from img_search.database.embeddings import (
@@ -16,210 +17,254 @@ from img_search.database.embeddings import (
 np = pytest.importorskip("numpy")
 
 
-class DummyFieldSchema:
-    def __init__(self, **kwargs: Any) -> None:
-        self.kwargs = kwargs
-
-
-class DummyCollectionSchema:
-    def __init__(self, *, fields: list[Any], description: str | None = None) -> None:
-        self.fields = fields
-        self.description = description
-
-
 class DummyDataType:
     VARCHAR = "VARCHAR"
     FLOAT_VECTOR = "FLOAT_VECTOR"
 
 
-class FakeConnections:
-    def __init__(self) -> None:
-        self.connected: dict[str, tuple[str, str]] = {}
+class DummySchema:
+    def __init__(self, *, auto_id: bool, description: str | None = None) -> None:
+        self.auto_id = auto_id
+        self.description = description
+        self.fields: list[tuple[str, Any, dict[str, Any]]] = []
+        self.primary_field: str | None = None
 
-    def has_connection(self, alias: str) -> bool:
-        return alias in self.connected
+    def add_field(self, field_name: str, datatype: Any, **kwargs: Any) -> None:
+        self.fields.append((field_name, datatype, kwargs))
+        if kwargs.get("is_primary"):
+            self.primary_field = field_name
 
-    def connect(self, alias: str, host: str, port: str) -> None:
-        self.connected[alias] = (host, port)
-
-    def disconnect(self, alias: str) -> None:
-        self.connected.pop(alias, None)
-
-
-class FakeUtility:
-    def has_collection(self, name: str, *, using: str | None = None) -> bool:  # noqa: ARG002
-        return name in FakeCollection.registry
-
-    def drop_collection(self, name: str, *, using: str | None = None) -> None:  # noqa: ARG002
-        FakeCollection.registry.pop(name, None)
+    def verify(self) -> None:  # pragma: no cover - compatibility shim
+        return
 
 
-class FakeHit:
-    def __init__(self, id_: str, distance: float, fields: dict[str, Any]) -> None:
-        self.id = id_
-        self.distance = distance
-        self.entity = fields
+class DummyIndexParams(list[dict[str, Any]]):
+    def add_index(self, **kwargs: Any) -> None:
+        self.append(kwargs)
 
 
-class FakeCollection:
-    registry: dict[str, FakeCollection] = {}
+class FakeMilvusClient:
+    def __init__(self, uri: str | None = None, **_: Any) -> None:  # noqa: D401
+        self.uri = uri
+        self.collections: dict[str, dict[str, Any]] = {}
+        self.closed = False
 
-    def __new__(cls, name: str, *args: Any, **kwargs: Any) -> FakeCollection:
-        if kwargs.get("schema") is not None:
-            instance = super().__new__(cls)
-            cls.registry[name] = instance
-            return instance
-        if name in cls.registry:
-            return cls.registry[name]
-        instance = super().__new__(cls)
-        cls.registry[name] = instance
-        return instance
+    # ------------------------------------------------------------------
+    # Schema helpers
+    # ------------------------------------------------------------------
+    def has_collection(self, name: str) -> bool:
+        return name in self.collections
 
-    def __init__(
+    def create_schema(
+        self, *, auto_id: bool, description: str | None = None
+    ) -> DummySchema:
+        return DummySchema(auto_id=auto_id, description=description)
+
+    def prepare_index_params(self, field_name: str | None = None) -> DummyIndexParams:  # noqa: D401
+        params = DummyIndexParams()
+        if field_name is not None:  # pragma: no cover - defensive branch
+            params.add_index(field_name=field_name)
+        return params
+
+    def create_collection(
         self,
-        name: str,
-        schema: DummyCollectionSchema | None = None,
+        collection_name: str,
         *,
-        using: str | None = None,
-        consistency_level: str | None = None,
+        schema: DummySchema,
+        index_params: DummyIndexParams,
+        **kwargs: Any,
     ) -> None:
-        if getattr(self, "_initialized", False):
-            return
-        self.name = name
-        self.schema = schema
-        self.using = using
-        self.consistency_level = consistency_level
-        self.loaded = False
-        self.indexes: list[tuple[str, dict[str, Any]]] = []
-        self.upserts: list[list[Any]] = []
-        self.inserts: list[list[Any]] = []
-        self.deleted_exprs: list[str] = []
-        self.search_calls: list[dict[str, Any]] = []
-        self.search_results: list[list[FakeHit]] = [[]]
-        self.flushed = False
-        self.released = False
-        self._initialized = True
+        self.collections[collection_name] = {
+            "schema": schema,
+            "index_params": list(index_params),
+            "loaded": False,
+            "data": [],
+            "search_calls": [],
+            "search_results": [[]],
+            "deleted_ids": [],
+            "flushed": False,
+            "released": False,
+            "dropped": False,
+            "consistency_level": kwargs.get("consistency_level"),
+            "primary_field": schema.primary_field,
+        }
 
-    def create_index(self, *, field_name: str, index_params: dict[str, Any]) -> None:
-        self.indexes.append((field_name, index_params))
+    # ------------------------------------------------------------------
+    # CRUD operations
+    # ------------------------------------------------------------------
+    def load_collection(self, collection_name: str, **_: Any) -> None:
+        self.collections[collection_name]["loaded"] = True
 
-    def load(self) -> None:
-        self.loaded = True
+    def release_collection(self, collection_name: str, **_: Any) -> None:
+        if collection_name in self.collections:
+            self.collections[collection_name]["released"] = True
 
-    def upsert(self, data: list[Any]) -> SimpleNamespace:
-        self.upserts.append(data)
-        return SimpleNamespace(primary_keys=data[0])
+    def upsert(
+        self, collection_name: str, data: list[Mapping[str, Any]], **_: Any
+    ) -> dict[str, Any]:
+        collection = self.collections[collection_name]
+        collection.setdefault("upserts", []).append(list(data))
+        collection["data"].extend(data)
+        primary_field = collection["primary_field"]
+        keys = [row[primary_field] for row in data]
+        return {"upsert_count": len(data), "primary_keys": keys}
 
-    def insert(self, data: list[Any]) -> SimpleNamespace:
-        self.inserts.append(data)
-        return SimpleNamespace(primary_keys=data[0])
-
-    def delete(self, expr: str) -> None:
-        self.deleted_exprs.append(expr)
+    def delete(self, collection_name: str, ids: list[str], **_: Any) -> dict[str, int]:
+        collection = self.collections[collection_name]
+        collection["deleted_ids"].append(list(ids))
+        return {"deleted_count": len(ids)}
 
     def search(
         self,
+        collection_name: str,
         *,
         data: list[list[float]],
-        anns_field: str,
-        param: dict[str, Any],
         limit: int,
-        expr: str | None,
+        filter: str,  # noqa: A002 - match Milvus client signature
         output_fields: list[str] | None,
-    ) -> list[list[FakeHit]]:
-        self.search_calls.append(
+        search_params: Mapping[str, Any] | None,
+        anns_field: str | None,
+        **_: Any,
+    ) -> list[list[dict[str, Any]]]:
+        collection = self.collections[collection_name]
+        collection["search_calls"].append(
             {
                 "data": data,
-                "anns_field": anns_field,
-                "param": param,
                 "limit": limit,
-                "expr": expr,
+                "filter": filter,
                 "output_fields": output_fields,
+                "search_params": dict(search_params or {}),
+                "anns_field": anns_field,
             }
         )
-        return self.search_results
+        return collection["search_results"]
 
-    def flush(self) -> None:
-        self.flushed = True
+    def flush(self, collection_name: str, **_: Any) -> None:
+        if collection_name in self.collections:
+            self.collections[collection_name]["flushed"] = True
 
-    def release(self) -> None:
-        self.released = True
+    def drop_collection(self, collection_name: str, **_: Any) -> None:
+        if collection_name in self.collections:
+            self.collections[collection_name]["dropped"] = True
+            self.collections.pop(collection_name)
+
+    def close(self) -> None:
+        self.closed = True
 
 
 @pytest.fixture(autouse=True)
-def mock_milvus(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
-    FakeCollection.registry.clear()
-    fake_connections = FakeConnections()
-    fake_utility = FakeUtility()
-
-    monkeypatch.setattr(embeddings_module, "connections", fake_connections)
-    monkeypatch.setattr(embeddings_module, "utility", fake_utility)
-    monkeypatch.setattr(embeddings_module, "Collection", FakeCollection)
-    monkeypatch.setattr(embeddings_module, "CollectionSchema", DummyCollectionSchema)
-    monkeypatch.setattr(embeddings_module, "FieldSchema", DummyFieldSchema)
+def mock_milvus(monkeypatch: pytest.MonkeyPatch) -> FakeMilvusClient:
     monkeypatch.setattr(embeddings_module, "DataType", DummyDataType)
+    monkeypatch.setattr(embeddings_module, "MilvusClient", FakeMilvusClient)
     monkeypatch.setattr(embeddings_module, "MilvusException", RuntimeError)
-    return {"connections": fake_connections, "utility": fake_utility}
+    client = FakeMilvusClient(uri="./test.db")
+    return client
 
 
-def test_collection_initialization_creates_index() -> None:
-    db = EmbeddingDatabase("test_collection", dim=4)
+def make_config(**overrides: Any) -> dict[str, Any]:
+    cfg: dict[str, Any] = {
+        "collection_name": "test_collection",
+        "dimension": 4,
+        "uri": "./test.db",
+    }
+    cfg.update(overrides)
+    return cfg
 
-    collection = FakeCollection.registry["test_collection"]
-    assert collection.schema is not None
-    assert collection.loaded is True
-    assert collection.indexes == [
-        (
-            "vector",
-            {
-                "index_type": db.index_type,
-                "metric_type": db.metric_type,
-                "params": embeddings_module.DEFAULT_INDEX_PARAMS,
-            },
-        )
+
+def test_initialization_creates_parent_dir_for_relative_uri(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    db = EmbeddingDatabase(make_config(uri="nested/milvus.db"))
+
+    assert Path("nested").is_dir()
+    assert db.uri.endswith("nested/milvus.db")
+    assert isinstance(db.client, FakeMilvusClient)
+
+
+def test_initialization_strips_file_scheme(tmp_path: Path) -> None:
+    target = tmp_path / "store" / "embeddings.db"
+    db = EmbeddingDatabase(make_config(uri=f"file:{target}"))
+
+    assert target.parent.is_dir()
+    assert db.uri == str(target)
+    assert isinstance(db.client, FakeMilvusClient)
+    assert db.client.uri == str(target)
+
+
+def test_collection_initialization_creates_index(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    client = FakeMilvusClient(uri="./test.db")
+    db = EmbeddingDatabase(make_config(), client=client)
+
+    collection = client.collections["test_collection"]
+    assert collection["loaded"] is True
+    assert collection["schema"].fields == [
+        ("id", DummyDataType.VARCHAR, {"is_primary": True, "max_length": 255}),
+        ("model_name", DummyDataType.VARCHAR, {"max_length": 255}),
+        ("dataset_name", DummyDataType.VARCHAR, {"max_length": 255}),
+        ("vector", DummyDataType.FLOAT_VECTOR, {"dim": 4}),
+    ]
+    assert collection["index_params"] == [
+        {
+            "field_name": "vector",
+            "metric_type": db.metric_type,
+            "index_type": db.index_type,
+        }
     ]
 
 
-def test_create_embedding_database_from_config() -> None:
+def test_create_embedding_database_from_config(monkeypatch: MonkeyPatch) -> None:
+    client = FakeMilvusClient(uri="./alt.db")
+
     cfg = {
         "collection_name": "cfg_collection",
-        "connection": {"host": "milvus", "port": 19531, "alias": "cfg"},
+        "dimension": 8,
+        "uri": "./alt.db",
         "metric_type": "L2",
-        "index": {"type": "DISKANN", "params": {"search_list": 50}},
-        "storage": {"path": "database/embeddings.db"},
+        "index": {"type": "FLAT", "params": {"nlist": 64}},
+        "fields": {
+            "id": {"max_length": 128},
+            "model": {"name": "model", "max_length": 64},
+            "dataset": {"name": "dataset", "max_length": 64},
+            "vector": {"name": "embedding"},
+        },
+        "collection": {"description": "Configured collection"},
+        "search": {"params": {"ef": 32}},
         "load_on_init": False,
     }
 
-    db = create_embedding_database(cfg, dim=8)
+    db = create_embedding_database(cfg, client=client)
 
     assert db.collection_name == "cfg_collection"
-    assert db.host == "milvus"
-    assert db.port == 19531
-    assert db.alias == "cfg"
     assert db.metric_type == "L2"
-    assert db.index_type == "DISKANN"
-    assert db.index_params == {"search_list": 50}
-    assert db.storage_path == Path("database/embeddings.db")
+    assert db.index_type == "FLAT"
     assert db.dim == 8
-    collection = FakeCollection.registry["cfg_collection"]
-    assert collection.loaded is False
-    assert collection.indexes == [
-        (
-            "vector",
-            {
-                "index_type": "DISKANN",
-                "metric_type": "L2",
-                "params": {"search_list": 50},
-            },
-        )
+    assert db.id_field == "id"
+    assert db.model_field == "model"
+    assert db.dataset_field == "dataset"
+    assert db.vector_field == "embedding"
+    assert db.default_search_params == {"ef": 32}
+    collection = client.collections["cfg_collection"]
+    assert collection["loaded"] is False
+    assert collection["schema"].description == "Configured collection"
+    assert collection["index_params"] == [
+        {
+            "field_name": "embedding",
+            "metric_type": "L2",
+            "index_type": "FLAT",
+            "params": {"nlist": 64},
+        }
     ]
 
 
 def test_add_embeddings_uses_upsert_and_returns_ids() -> None:
-    db = EmbeddingDatabase("demo", dim=2)
+    client = FakeMilvusClient(uri="./test.db")
+    db = EmbeddingDatabase(make_config(), client=client)
     vectors = [
-        np.array([1.0, 0.0], dtype="float32"),
-        np.array([0.0, 1.0], dtype="float32"),
+        np.array([1.0, 0.0, 0.0, 0.0], dtype="float32"),
+        np.array([0.0, 1.0, 0.0, 0.0], dtype="float32"),
     ]
 
     ids = db.add_embeddings(
@@ -230,55 +275,73 @@ def test_add_embeddings_uses_upsert_and_returns_ids() -> None:
     )
 
     assert ids == ["a", "b"]
-    collection = FakeCollection.registry["demo"]
-    assert collection.upserts == [
+    collection = client.collections["test_collection"]
+    assert collection["upserts"] == [
         [
-            ["a", "b"],
-            ["model", "model"],
-            ["dataset", "dataset"],
-            [[1.0, 0.0], [0.0, 1.0]],
+            {
+                "id": "a",
+                "model_name": "model",
+                "dataset_name": "dataset",
+                "vector": [1.0, 0.0, 0.0, 0.0],
+            },
+            {
+                "id": "b",
+                "model_name": "model",
+                "dataset_name": "dataset",
+                "vector": [0.0, 1.0, 0.0, 0.0],
+            },
         ]
     ]
 
 
 def test_search_returns_hit_payload() -> None:
-    db = EmbeddingDatabase("search", dim=3)
-    collection = FakeCollection.registry["search"]
-    collection.search_results = [
+    client = FakeMilvusClient(uri="./test.db")
+    db = EmbeddingDatabase(make_config(), client=client)
+    collection = client.collections["test_collection"]
+    collection["search_results"] = [
         [
-            FakeHit("item-1", 0.1, {"model_name": "m1", "dataset_name": "d1"}),
-            FakeHit("item-2", 0.2, {"model_name": "m1", "dataset_name": "d2"}),
+            {
+                "id": "item-1",
+                "distance": 0.1,
+                "entity": {"model_name": "m1", "dataset_name": "d1"},
+            },
+            {
+                "id": "item-2",
+                "distance": 0.2,
+                "entity": {"model_name": "m1", "dataset_name": "d2"},
+            },
         ]
     ]
 
-    results = db.search(np.array([1.0, 2.0, 3.0], dtype="float32"), top_k=2)
+    results = db.search(np.ones(4, dtype="float32"), top_k=2)
 
     assert results == [
         {"id": "item-1", "distance": 0.1, "model_name": "m1", "dataset_name": "d1"},
         {"id": "item-2", "distance": 0.2, "model_name": "m1", "dataset_name": "d2"},
     ]
-    assert collection.search_calls[0]["limit"] == 2
-    assert collection.search_calls[0]["anns_field"] == "vector"
+    assert collection["search_calls"][0]["limit"] == 2
+    assert collection["search_calls"][0]["anns_field"] == "vector"
 
 
-def test_delete_builds_expression() -> None:
-    db = EmbeddingDatabase("delete", dim=2)
-    collection = FakeCollection.registry["delete"]
+def test_delete_passes_ids_to_client() -> None:
+    client = FakeMilvusClient(uri="./test.db")
+    db = EmbeddingDatabase(make_config(), client=client)
 
     db.delete(["x", "y"])
 
-    assert collection.deleted_exprs == ['id in ["x", "y"]']
+    collection = client.collections["test_collection"]
+    assert collection["deleted_ids"] == [["x", "y"]]
 
 
 def test_drop_and_close_release_resources() -> None:
-    db = EmbeddingDatabase("cleanup", dim=2)
-    collection = FakeCollection.registry["cleanup"]
+    client = FakeMilvusClient(uri="./test.db")
+    db = EmbeddingDatabase(make_config(), client=client)
 
     db.drop()
-    assert "cleanup" not in FakeCollection.registry
+    assert "test_collection" not in client.collections
 
     db.close()
-    assert collection.released is True
+    assert client.closed is True
 
 
 def test_as_float_vectors_validates_shape() -> None:

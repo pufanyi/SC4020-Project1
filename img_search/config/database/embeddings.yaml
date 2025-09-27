@@ -1,0 +1,27 @@
+# Default configuration for the Milvus Lite backed embedding database.
+# The embedding dimension should be overridden to match the active encoder.
+# Relative paths are expanded from the working directory and any missing parent
+# folders are created automatically.
+collection_name: img_embeddings
+dimension: 512
+uri: ./storage/milvus_lite.db
+metric_type: COSINE
+index:
+  type: AUTOINDEX
+fields:
+  id:
+    name: id
+    max_length: 255
+  model:
+    name: model_name
+    max_length: 255
+  dataset:
+    name: dataset_name
+    max_length: 255
+  vector:
+    name: vector
+collection:
+  description: Image embedding store
+search:
+  params: {}
+load_on_init: true

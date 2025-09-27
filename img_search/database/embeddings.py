@@ -1,11 +1,12 @@
-"""Milvus-backed embedding storage helpers.
+"""Milvus Lite backed embedding storage helpers.
 
-This module exposes a thin wrapper around a Milvus collection so the rest of
-the application can store and query image embeddings without juggling
-`pymilvus` primitives directly.  The implementation is intentionally minimal –
-enough to bootstrap a local Milvus deployment for development and testing –
-while still exposing convenience helpers for inserting, searching, and
-deleting embeddings.
+This module wraps :class:`pymilvus.MilvusClient` so callers can treat the
+embedding database as a simple Python object.  The implementation focuses on a
+file-backed Milvus Lite deployment which is well suited for local development
+and testing – a single ``.db`` file stores all data without needing an
+external Milvus service.  The wrapper still mirrors the previous API surface so
+callers can insert, search, and delete vectors without learning the Milvus
+client surface area.
 
 Example
 -------
@@ -13,7 +14,13 @@ Example
 ```python
 from img_search.database.embeddings import EmbeddingDatabase
 
-db = EmbeddingDatabase("img_embeddings", dim=512)
+db = EmbeddingDatabase(
+    {
+        "collection_name": "img_embeddings",
+        "dimension": 512,
+        "uri": "./milvus_lite.db",
+    }
+)
 db.add_embeddings(
     ids=["cat-1", "cat-2"],
     embeddings=[cat_vector, another_cat_vector],
@@ -24,9 +31,10 @@ db.add_embeddings(
 results = db.search(cat_query_vector, top_k=5)
 ```
 
-The class manages connection lifecycle, schema bootstrapping, and index
-creation on first use.  Consumers only need a running Milvus instance – e.g.
-`milvus-standalone` via Docker – listening on ``host``/``port``.
+The class lazily initialises the Milvus collection, creates an AUTOINDEX index
+compatible with Milvus Lite, and exposes helpers for common CRUD operations.
+Configurations are designed to be Hydra friendly – pass any mapping (or
+``DictConfig``) containing the relevant keys and the wrapper resolves the rest.
 """
 
 from __future__ import annotations
@@ -35,17 +43,10 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import numpy as np
-from pymilvus import (
-    Collection,
-    CollectionSchema,
-    DataType,
-    FieldSchema,
-    MilvusException,
-    connections,
-    utility,
-)
+from pymilvus import DataType, MilvusClient, MilvusException
 
 try:  # Optional dependency when Hydra isn't installed in minimal contexts
     from omegaconf import DictConfig, OmegaConf
@@ -57,8 +58,13 @@ except ModuleNotFoundError:  # pragma: no cover - Hydra-less environments
     DictConfig = _DictConfigFallback  # type: ignore[assignment]
     OmegaConf = None  # type: ignore[assignment]
 
-DEFAULT_INDEX_PARAMS: dict[str, Any] = {"M": 16, "efConstruction": 200}
-DEFAULT_SEARCH_PARAMS: dict[str, Any] = {"params": {"ef": 64}}
+DEFAULT_INDEX_TYPE = "AUTOINDEX"
+DEFAULT_METRIC_TYPE = "COSINE"
+DEFAULT_ID_FIELD = "id"
+DEFAULT_VECTOR_FIELD = "vector"
+DEFAULT_MODEL_FIELD = "model_name"
+DEFAULT_DATASET_FIELD = "dataset_name"
+DEFAULT_MAX_LENGTH = 255
 
 
 def _as_float_vectors(vectors: Iterable[np.ndarray], *, dim: int) -> list[list[float]]:
@@ -76,11 +82,6 @@ def _as_float_vectors(vectors: Iterable[np.ndarray], *, dim: int) -> list[list[f
     return data
 
 
-def _make_expr(field: str, ids: Sequence[str]) -> str:
-    quoted = ", ".join(f'"{identifier}"' for identifier in ids)
-    return f"{field} in [{quoted}]"
-
-
 def _config_to_dict(cfg: DictConfig | Mapping[str, Any]) -> dict[str, Any]:
     if OmegaConf is not None and isinstance(cfg, DictConfig):
         container = OmegaConf.to_container(cfg, resolve=True)
@@ -91,170 +92,196 @@ def _config_to_dict(cfg: DictConfig | Mapping[str, Any]) -> dict[str, Any]:
     return {str(key): value for key, value in container.items()}
 
 
+def _ensure_mapping(value: Mapping[str, Any] | None, *, label: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{label} must be a mapping when provided")
+    return {str(key): val for key, val in value.items()}
+
+
+def _resolve_dimension(config: Mapping[str, Any]) -> int:
+    dim = config.get("dimension", config.get("dim"))
+    if dim is None:
+        raise ValueError(
+            "Embedding database config must specify a `dimension`/`dim` value"
+        )
+    try:
+        return int(dim)
+    except (TypeError, ValueError) as exc:  # pragma: no cover - defensive branch
+        raise ValueError("Embedding dimension must be an integer") from exc
+
+
+def _field_config(
+    fields_cfg: Mapping[str, Any],
+    key: str,
+    *,
+    default_name: str,
+    default_max_length: int | None,
+) -> tuple[str, int | None]:
+    value = fields_cfg.get(key, {})
+    if value is None:
+        value = {}
+    if not isinstance(value, Mapping):
+        raise TypeError(f"database.fields.{key} must be a mapping when provided")
+    name = str(value.get("name", default_name))
+    max_length = value.get("max_length", default_max_length)
+    if max_length is None:
+        return name, None
+    try:
+        return name, int(max_length)
+    except (TypeError, ValueError) as exc:  # pragma: no cover - defensive branch
+        raise ValueError(
+            f"database.fields.{key}.max_length must be an integer when provided"
+        ) from exc
+
+
+def _normalize_uri(uri: Any) -> str:
+    uri_str = str(uri)
+    parsed = urlparse(uri_str)
+    if parsed.scheme and parsed.scheme not in {"file"}:
+        return uri_str
+
+    path_str = parsed.path if parsed.scheme == "file" else uri_str
+    path = Path(path_str).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
 def create_embedding_database(
     cfg: DictConfig | Mapping[str, Any],
     *,
-    dim: int,
+    dim: int | None = None,
+    client: MilvusClient | None = None,
 ) -> EmbeddingDatabase:
     """Instantiate :class:`EmbeddingDatabase` from a Hydra/OmegaConf config."""
 
     config = _config_to_dict(cfg)
-
-    connection_cfg = config.get("connection", {})
-    if connection_cfg is None:
-        connection_cfg = {}
-    if not isinstance(connection_cfg, Mapping):
-        raise TypeError("database.connection must be a mapping when provided")
-
-    index_cfg = config.get("index", {})
-    if index_cfg is None:
-        index_cfg = {}
-    if not isinstance(index_cfg, Mapping):
-        raise TypeError("database.index must be a mapping when provided")
-
-    storage_cfg = config.get("storage", {})
-    if storage_cfg is None:
-        storage_cfg = {}
-    if not isinstance(storage_cfg, Mapping):
-        raise TypeError("database.storage must be a mapping when provided")
-
-    collection_name = config.get("collection_name", "img_embeddings")
-    host = connection_cfg.get("host", "127.0.0.1")
-    port = connection_cfg.get("port", 19530)
-    alias = connection_cfg.get("alias", "default")
-    metric_type = config.get("metric_type", "IP")
-
-    index_type = index_cfg.get("type", config.get("index_type", "HNSW"))
-    index_params = index_cfg.get("params", config.get("index_params"))
-    if index_params is not None and not isinstance(index_params, Mapping):
-        raise TypeError("database.index.params must be a mapping when provided")
-    index_params_dict = (
-        dict(index_params) if isinstance(index_params, Mapping) else None
-    )
-
-    load_on_init = config.get("load_on_init", True)
-    storage_path = storage_cfg.get("path", config.get("path"))
-
-    return EmbeddingDatabase(
-        collection_name,
-        dim,
-        host=str(host),
-        port=port,
-        alias=str(alias),
-        metric_type=str(metric_type),
-        index_type=str(index_type),
-        index_params=index_params_dict,
-        load_on_init=bool(load_on_init),
-        storage_path=storage_path,
-    )
+    if dim is not None:
+        config.setdefault("dimension", dim)
+    return EmbeddingDatabase(config, client=client)
 
 
 class EmbeddingDatabase:
-    """Milvus collection wrapper for storing and querying embeddings."""
+    """Milvus Lite wrapper for storing and querying embeddings."""
 
     __slots__ = (
         "collection_name",
+        "collection_description",
+        "consistency_level",
         "dim",
-        "host",
-        "port",
-        "alias",
         "metric_type",
         "index_type",
+        "index_name",
         "index_params",
         "load_on_init",
-        "storage_path",
-        "_collection",
+        "default_search_params",
+        "id_field",
+        "id_max_length",
+        "model_field",
+        "model_max_length",
+        "dataset_field",
+        "dataset_max_length",
+        "vector_field",
+        "uri",
+        "client",
+        "_loaded",
     )
 
     def __init__(
         self,
-        collection_name: str,
-        dim: int,
+        config: Mapping[str, Any],
         *,
-        host: str = "127.0.0.1",
-        port: int | str = 19530,
-        alias: str = "default",
-        metric_type: str = "IP",
-        index_type: str = "HNSW",
-        index_params: dict[str, Any] | None = None,
-        load_on_init: bool = True,
-        storage_path: str | Path | None = None,
+        client: MilvusClient | None = None,
     ) -> None:
-        self.collection_name = collection_name
-        self.dim = dim
-        self.host = host
-        self.port = port
-        self.alias = alias
-        self.metric_type = metric_type
-        self.index_type = index_type
-        self.index_params = index_params
-        self.load_on_init = load_on_init
-        self.storage_path = Path(storage_path) if storage_path is not None else None
-        self._collection: Collection | None = None
-        self._connect()
-        self._collection = self._ensure_collection()
-        if self.load_on_init:
-            self._collection.load()
+        config_dict = _config_to_dict(config)
+        self.dim = _resolve_dimension(config_dict)
+        self.collection_name = str(config_dict.get("collection_name", "img_embeddings"))
 
-    # ------------------------------------------------------------------
-    # Connection / collection lifecycle helpers
-    # ------------------------------------------------------------------
-    def _connect(self) -> None:
-        if not connections.has_connection(self.alias):
-            connections.connect(self.alias, host=self.host, port=str(self.port))
+        uri = config_dict.get("uri")
+        if uri is None:
+            storage_cfg = config_dict.get("storage")
+            if isinstance(storage_cfg, Mapping):
+                uri = storage_cfg.get("path")
+        if uri is None:
+            uri = config_dict.get("path", "./milvus_lite.db")
+        self.uri = _normalize_uri(uri)
 
-    def _build_schema(self) -> CollectionSchema:
-        return CollectionSchema(
-            fields=[
-                FieldSchema(
-                    name="id",
-                    dtype=DataType.VARCHAR,
-                    is_primary=True,
-                    auto_id=False,
-                    max_length=255,
-                ),
-                FieldSchema(
-                    name="model_name",
-                    dtype=DataType.VARCHAR,
-                    max_length=255,
-                ),
-                FieldSchema(
-                    name="dataset_name",
-                    dtype=DataType.VARCHAR,
-                    max_length=255,
-                ),
-                FieldSchema(
-                    name="vector",
-                    dtype=DataType.FLOAT_VECTOR,
-                    dim=self.dim,
-                ),
-            ],
-            description="Image embedding store",
+        client_cfg = _ensure_mapping(
+            config_dict.get("client", {}), label="database.client"
+        )
+        self.metric_type = str(config_dict.get("metric_type", DEFAULT_METRIC_TYPE))
+
+        index_cfg = _ensure_mapping(
+            config_dict.get("index", {}), label="database.index"
+        )
+        self.index_type = str(index_cfg.get("type", DEFAULT_INDEX_TYPE))
+        self.index_name = index_cfg.get("name")
+        self.index_params = (
+            dict(index_cfg.get("params", {}))
+            if isinstance(index_cfg.get("params", {}), Mapping)
+            else {}
+        )
+        if index_cfg.get("params") is not None and not isinstance(
+            index_cfg.get("params"), Mapping
+        ):
+            raise TypeError("database.index.params must be a mapping when provided")
+
+        search_cfg = _ensure_mapping(
+            config_dict.get("search", {}), label="database.search"
+        )
+        params_cfg = search_cfg.get("params", {})
+        if params_cfg is not None and not isinstance(params_cfg, Mapping):
+            raise TypeError("database.search.params must be a mapping when provided")
+        self.default_search_params = dict(params_cfg or {})
+
+        fields_cfg = _ensure_mapping(
+            config_dict.get("fields", {}), label="database.fields"
+        )
+        self.id_field, self.id_max_length = _field_config(
+            fields_cfg,
+            "id",
+            default_name=config_dict.get("id_field", DEFAULT_ID_FIELD),
+            default_max_length=config_dict.get("id_max_length", DEFAULT_MAX_LENGTH),
+        )
+        self.vector_field, _ = _field_config(
+            fields_cfg,
+            "vector",
+            default_name=config_dict.get("vector_field", DEFAULT_VECTOR_FIELD),
+            default_max_length=None,
+        )
+        self.model_field, self.model_max_length = _field_config(
+            fields_cfg,
+            "model",
+            default_name=config_dict.get("model_field", DEFAULT_MODEL_FIELD),
+            default_max_length=config_dict.get("model_max_length", DEFAULT_MAX_LENGTH),
+        )
+        self.dataset_field, self.dataset_max_length = _field_config(
+            fields_cfg,
+            "dataset",
+            default_name=config_dict.get("dataset_field", DEFAULT_DATASET_FIELD),
+            default_max_length=config_dict.get(
+                "dataset_max_length", DEFAULT_MAX_LENGTH
+            ),
         )
 
-    def _ensure_collection(self) -> Collection:
-        if not utility.has_collection(self.collection_name, using=self.alias):
-            schema = self._build_schema()
-            collection = Collection(
-                name=self.collection_name,
-                schema=schema,
-                using=self.alias,
-                consistency_level="Strong",
-            )
-            index_params = {
-                "index_type": self.index_type,
-                "metric_type": self.metric_type,
-                "params": self.index_params or DEFAULT_INDEX_PARAMS,
-            }
-            collection.create_index(field_name="vector", index_params=index_params)
-            return collection
-        return Collection(self.collection_name, using=self.alias)
+        collection_cfg = _ensure_mapping(
+            config_dict.get("collection", {}), label="database.collection"
+        )
+        self.collection_description = str(
+            collection_cfg.get("description", "Image embedding store")
+        )
+        self.consistency_level = collection_cfg.get("consistency_level")
 
-    @property
-    def collection(self) -> Collection:
-        if self._collection is None:
-            raise RuntimeError("Collection has not been initialized")
-        return self._collection
+        self.load_on_init = bool(config_dict.get("load_on_init", True))
+
+        self.client = client or MilvusClient(uri=self.uri, **client_cfg)
+        self._ensure_collection()
+        self._loaded = False
+        if self.load_on_init:
+            self._load_collection()
 
     # ------------------------------------------------------------------
     # CRUD operations
@@ -271,34 +298,27 @@ class EmbeddingDatabase:
             raise ValueError("`ids` and `embeddings` must have the same length")
 
         vectors = _as_float_vectors(embeddings, dim=self.dim)
-        self.collection.load()
-        try:
-            result = self.collection.upsert(
-                data=[
-                    list(ids),
-                    [model_name] * len(ids),
-                    [dataset_name] * len(ids),
-                    vectors,
-                ]
+        self._load_collection()
+
+        payload = []
+        for identifier, vector in zip(ids, vectors, strict=True):
+            payload.append(
+                {
+                    self.id_field: identifier,
+                    self.model_field: model_name,
+                    self.dataset_field: dataset_name,
+                    self.vector_field: vector,
+                }
             )
-        except AttributeError:
-            # Older Milvus releases do not expose ``Collection.upsert``; emulate it.
-            self.delete(ids)
-            result = self.collection.insert(
-                [
-                    list(ids),
-                    [model_name] * len(ids),
-                    [dataset_name] * len(ids),
-                    vectors,
-                ]
-            )
-        return list(result.primary_keys)  # type: ignore[no-any-return]
+
+        result = self.client.upsert(self.collection_name, payload)
+        primary_keys = result.get("primary_keys") or []
+        return [str(pk) for pk in primary_keys]
 
     def delete(self, ids: Sequence[str]) -> None:
         if not ids:
             return
-        expr = _make_expr("id", ids)
-        self.collection.delete(expr)
+        self.client.delete(self.collection_name, ids=list(ids))
 
     def search(
         self,
@@ -310,27 +330,32 @@ class EmbeddingDatabase:
         search_params: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         vector = _as_float_vectors([query], dim=self.dim)[0]
-        params = search_params or {
-            **DEFAULT_SEARCH_PARAMS,
-            "metric_type": self.metric_type,
-        }
-        self.collection.load()
-        results = self.collection.search(
+        params = dict(self.default_search_params)
+        if search_params:
+            params.update(search_params)
+
+        self._load_collection()
+        results = self.client.search(
+            self.collection_name,
             data=[vector],
-            anns_field="vector",
-            param=params,
             limit=top_k,
-            expr=filter_expression,
+            filter=filter_expression or "",
             output_fields=list(output_fields) if output_fields else None,
+            search_params=params or None,
+            anns_field=self.vector_field,
         )
+
         hits: list[dict[str, Any]] = []
+        if not results:
+            return hits
+
         for hit in results[0]:
             payload = {
-                "id": hit.id,
-                "distance": hit.distance,
+                "id": hit.get("id"),
+                "distance": hit.get("distance"),
             }
-            entity = hit.entity
-            if entity is not None and output_fields:
+            entity = hit.get("entity") or {}
+            if output_fields:
                 for field in output_fields:
                     payload[field] = entity.get(field)
             hits.append(payload)
@@ -338,27 +363,91 @@ class EmbeddingDatabase:
 
     def drop(self) -> None:
         try:
-            utility.drop_collection(self.collection_name, using=self.alias)
+            self.client.drop_collection(self.collection_name)
         except MilvusException:
             # Collection might have already been removed; ignore.
             pass
 
     def flush(self) -> None:
-        self.collection.flush()
+        self.client.flush(self.collection_name)
 
     def close(self) -> None:
         try:
-            self.collection.release()
+            try:
+                self.client.release_collection(self.collection_name)
+            except MilvusException:
+                pass
         finally:
-            if connections.has_connection(self.alias):
-                connections.disconnect(self.alias)
+            self.client.close()
 
     @contextmanager
-    def session(self) -> Iterator[Collection]:
+    def session(self) -> Iterator[EmbeddingDatabase]:
         try:
-            yield self.collection
+            yield self
         finally:
             self.flush()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _ensure_collection(self) -> None:
+        if self.client.has_collection(self.collection_name):
+            return
+
+        schema = self.client.create_schema(
+            auto_id=False, description=self.collection_description
+        )
+        schema.add_field(
+            self.id_field,
+            DataType.VARCHAR,
+            is_primary=True,
+            max_length=self.id_max_length,
+        )
+        schema.add_field(
+            self.model_field,
+            DataType.VARCHAR,
+            max_length=self.model_max_length,
+        )
+        schema.add_field(
+            self.dataset_field,
+            DataType.VARCHAR,
+            max_length=self.dataset_max_length,
+        )
+        schema.add_field(
+            self.vector_field,
+            DataType.FLOAT_VECTOR,
+            dim=self.dim,
+        )
+
+        index_params = self.client.prepare_index_params()
+        index_kwargs: dict[str, Any] = {}
+        if self.index_name:
+            index_kwargs["index_name"] = str(self.index_name)
+        if self.index_params:
+            index_kwargs["params"] = dict(self.index_params)
+        index_params.add_index(
+            field_name=self.vector_field,
+            metric_type=self.metric_type,
+            index_type=self.index_type,
+            **index_kwargs,
+        )
+
+        create_kwargs: dict[str, Any] = {}
+        if self.consistency_level is not None:
+            create_kwargs["consistency_level"] = self.consistency_level
+
+        self.client.create_collection(
+            self.collection_name,
+            schema=schema,
+            index_params=index_params,
+            **create_kwargs,
+        )
+
+    def _load_collection(self) -> None:
+        if self._loaded:
+            return
+        self.client.load_collection(self.collection_name)
+        self._loaded = True
 
 
 __all__ = ["EmbeddingDatabase", "create_embedding_database"]
